@@ -387,46 +387,103 @@ def download_xml_batch(entries: List[Dict]) -> List[Dict]:
 # XML PARSING
 # ============================================================================
 
-def extract_value(root: ET.Element, xpaths: List[str]) -> Optional[str]:
+"""
+Bug fix for extract_value() in irs990_balance_sheet_parser_custom.py
+and irs990_balance_sheet_parser_big.py
+ 
+THE BUG:
+  The namespace fallback in extract_value() only matches the leaf element name
+  (e.g., "EOYAmt") without checking the parent element. Since nearly all XPaths
+  end in "EOYAmt", every field extracts the SAME value — whichever EOYAmt element
+  appears first in the XML tree.
+ 
+THE FIX:
+  Match the full parent/child path by local name, not just the leaf.
+ 
+Replace the extract_value function in BOTH scripts with the version below.
+The function signature and return type are unchanged — only the internal logic differs.
+"""
+ 
+ 
+def extract_value(root, xpaths):
     """
     Extract a value from XML using multiple possible XPaths.
-    
-    Tries each XPath pattern until one matches. Handles namespace variations.
-    
+ 
+    Tries each XPath pattern until one matches. Handles namespace variations
+    by matching on local element names when direct XPath fails.
+ 
     Args:
-        root: XML root element
-        xpaths: List of XPath patterns to try
-    
+        root: XML root element (ET.Element)
+        xpaths: List of XPath patterns to try (e.g., ['.//TotalAssetsGrp/EOYAmt', ...])
+ 
     Returns:
         The extracted value as a string, or None if not found
     """
     for xpath in xpaths:
-        # Try direct XPath (handles most files)
+        # Attempt 1: Direct XPath (works when XML has no namespace)
         try:
             elements = root.findall(xpath)
             if elements and elements[0].text:
                 return elements[0].text.strip()
-        except:
+        except Exception:
             pass
-        
-        # Try with namespace wildcard for stubborn files
-        # Convert './/ElementName/SubElement' to './/{*}ElementName/{*}SubElement'
+ 
+        # Attempt 2: Namespace-agnostic search by local name
+        # For a path like './/LandBldgEquipBasisNetGrp/EOYAmt', we need to find
+        # an element named 'EOYAmt' whose PARENT is named 'LandBldgEquipBasisNetGrp'.
         try:
-            # Build a namespace-agnostic version
-            parts = xpath.replace('.//', '').split('/')
-            ns_xpath = './/' + '/'.join([f"*[local-name()='{p}']" for p in parts if p])
-            
-            # Use iter to find elements by local name
-            for part in parts:
-                if part:
-                    for elem in root.iter():
-                        local_name = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
-                        if local_name == parts[-1] and elem.text:
-                            return elem.text.strip()
-        except:
+            parts = [p for p in xpath.replace('.//', '').split('/') if p]
+ 
+            if len(parts) == 1:
+                # Single element name — just find by local name
+                target = parts[0]
+                for elem in root.iter():
+                    local_name = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                    if local_name == target and elem.text and elem.text.strip():
+                        return elem.text.strip()
+ 
+            elif len(parts) == 2:
+                # Parent/child pair — match both local names
+                parent_name, child_name = parts
+                for elem in root.iter():
+                    local_name = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                    if local_name == parent_name:
+                        # Found the parent — now look for the child within it
+                        for child in elem:
+                            child_local = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                            if child_local == child_name and child.text and child.text.strip():
+                                return child.text.strip()
+ 
+            else:
+                # Deeper nesting (rare) — walk the full path
+                # Find all elements matching the first part, then drill down
+                first_name = parts[0]
+                for elem in root.iter():
+                    local_name = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                    if local_name == first_name:
+                        # Walk remaining parts as children
+                        current = elem
+                        matched = True
+                        for part in parts[1:]:
+                            found_child = None
+                            for child in current:
+                                child_local = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                                if child_local == part:
+                                    found_child = child
+                                    break
+                            if found_child is not None:
+                                current = found_child
+                            else:
+                                matched = False
+                                break
+                        if matched and current.text and current.text.strip():
+                            return current.text.strip()
+ 
+        except Exception:
             pass
-    
+ 
     return None
+ 
 
 
 def extract_header_info(root: ET.Element) -> Dict[str, Optional[str]]:
@@ -701,14 +758,14 @@ def run_pipeline(
     if skip_download:
         logger.info("Skipping download, using cached files...")
         for entry in entries:
-            filename = f"{entry['ein']}_{entry['tax_year']}_990.xml"
+            # Cache filenames use 4-digit year, but entry tax_year may be 'YYYY-01-01'
+            tax_year_short = entry['tax_year'][:4]
+            filename = f"{entry['ein']}_{tax_year_short}_990.xml"
             local_path = Config.XML_CACHE_DIR / filename
             entry['local_path'] = local_path if local_path.exists() else None
-        
+
         cached_count = sum(1 for e in entries if e.get('local_path'))
         logger.info(f"Found {cached_count:,} cached files")
-    else:
-        entries = download_xml_batch(entries)
     
     # Step 4: Parse XMLs
     logger.info("\n--- Step 4: Parsing XML Files ---")
